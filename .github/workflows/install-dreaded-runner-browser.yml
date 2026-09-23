@@ -1,0 +1,73 @@
+name: Install browser for Dreaded self-hosted runner
+on:
+  push:
+    branches:
+      - ops/dreaded-runner-browser-2026-09-23
+    paths:
+      - ops/browser-trigger
+permissions:
+  contents: write
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create ephemeral transport key
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out /tmp/private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/private.pem -pubout -out /tmp/public.pem
+          content="$(base64 -w0 /tmp/public.pem)"
+          path="ops/browser-transport-${RUN_ID}.pem"
+          body="$(jq -nc --arg message 'ops: publish ephemeral browser-install public key' --arg content "$content" --arg branch "$BRANCH" '{message:$message,content:$content,branch:$branch}')"
+          curl -fsS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/contents/$path" -d "$body" >/dev/null
+      - name: Wait for encrypted SSH payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          path="ops/browser-payload-${RUN_ID}.b64"
+          for i in $(seq 1 180); do
+            api="https://api.github.com/repos/$REPO/contents/$path?ref=$BRANCH"
+            if json="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$api" 2>/dev/null)"; then
+              printf '%s' "$json" | jq -r '.content' | tr -d '\n' | base64 -d > /tmp/payload.txt || true
+              if grep -Eq '^[A-Za-z0-9+/=]+$' /tmp/payload.txt 2>/dev/null; then cp /tmp/payload.txt /tmp/payload.b64; exit 0; fi
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Install browser on Dreaded runner host
+        run: |
+          set -euo pipefail
+          base64 -d /tmp/payload.b64 > /tmp/payload.bin
+          openssl pkeyutl -decrypt -inkey /tmp/private.pem -in /tmp/payload.bin -out /tmp/vps_key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          chmod 600 /tmp/vps_key
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -t ed25519 167.114.114.36 > "$HOME/.ssh/hostkey"
+          actual="$(ssh-keygen -lf "$HOME/.ssh/hostkey" -E sha256 | awk '{print $2}')"
+          test "$actual" = 'SHA256:qlSR4vZ8lMpGsA2rLyqZQlPF/KvYK0UgQP40odrvl+g'
+          cp "$HOME/.ssh/hostkey" "$HOME/.ssh/known_hosts"
+          ssh -i /tmp/vps_key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes ubuntu@167.114.114.36 'bash -s' < ops/install-browser.sh | tee /tmp/browser-report.txt
+      - name: Publish report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [[ -f /tmp/browser-report.txt ]] || echo 'Browser install did not reach report generation.' > /tmp/browser-report.txt
+          content="$(base64 -w0 /tmp/browser-report.txt)"
+          path="ops/browser-result-${RUN_ID}.txt"
+          body="$(jq -nc --arg message 'ops: record Dreaded runner browser install' --arg content "$content" --arg branch "$BRANCH" '{message:$message,content:$content,branch:$branch}')"
+          curl -fsS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/contents/$path" -d "$body" >/dev/null
